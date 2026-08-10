@@ -21909,6 +21909,127 @@ async def test_retry_http_bridge_fresh_hard_request_excludes_silent_account(
 
 
 @pytest.mark.asyncio
+async def test_http_bridge_eventless_stream_incomplete_uses_bounded_precreated_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-eventless-stream-incomplete",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        awaiting_response_created=True,
+        request_text='{"type":"response.create","model":"gpt-5.6-sol","input":"hello"}',
+        transport="http",
+        skip_request_log=True,
+    )
+    session = _make_bridge_session(
+        key_value="bridge-eventless-stream-incomplete",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    session.upstream = cast(
+        UpstreamWebSocket,
+        SimpleNamespace(
+            receive=AsyncMock(
+                return_value=UpstreamWebSocketMessage(
+                    kind="error",
+                    error="Upstream websocket closed before response.completed: no close frame received or sent",
+                    error_code="stream_incomplete",
+                )
+            ),
+            close=AsyncMock(),
+        ),
+    )
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+
+    replayed = asyncio.Event()
+
+    async def wait_for_cancel() -> UpstreamWebSocketMessage:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def replay_and_replace(retry_session: proxy_service._HTTPBridgeSession) -> bool:
+        retry_session.upstream = cast(
+            UpstreamWebSocket,
+            SimpleNamespace(receive=wait_for_cancel, close=AsyncMock()),
+        )
+        replayed.set()
+        return True
+
+    retry_precreated = AsyncMock(side_effect=replay_and_replace)
+    fail_pending = AsyncMock()
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry_precreated)
+    monkeypatch.setattr(service, "_fail_pending_websocket_requests", fail_pending)
+
+    reader_task = asyncio.create_task(service._relay_http_bridge_upstream_messages(session))
+    try:
+        await asyncio.wait_for(replayed.wait(), timeout=1.0)
+        retry_precreated.assert_awaited_once_with(session)
+        fail_pending.assert_not_awaited()
+    finally:
+        reader_task.cancel()
+        await asyncio.gather(reader_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_eventless_stream_incomplete_rejects_ambiguous_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-eventless-ambiguous-continuation",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        awaiting_response_created=True,
+        previous_response_id="resp-ambiguous-anchor",
+        request_text=(
+            '{"type":"response.create","model":"gpt-5.6-sol",'
+            '"previous_response_id":"resp-ambiguous-anchor","input":"tool output"}'
+        ),
+        transport="http",
+        skip_request_log=True,
+    )
+    session = _make_bridge_session(
+        key_value="bridge-eventless-ambiguous-continuation",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    session.upstream = cast(
+        UpstreamWebSocket,
+        SimpleNamespace(
+            receive=AsyncMock(
+                return_value=UpstreamWebSocketMessage(
+                    kind="error",
+                    error="Upstream websocket closed before response.completed: no close frame received or sent",
+                    error_code="stream_incomplete",
+                )
+            ),
+            close=AsyncMock(),
+        ),
+    )
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(service, "_http_bridge_precreated_retry_allowed", AsyncMock(return_value=True))
+    fail_reader = AsyncMock()
+    monkeypatch.setattr(service, "_fail_http_bridge_reader_and_maybe_retire", fail_reader)
+
+    with caplog.at_level(logging.WARNING):
+        await service._relay_http_bridge_upstream_messages(session)
+
+    assert request_state.replay_count == 0
+    fail_reader.assert_awaited_once()
+    assert "event=retry_precreated_eventless_skipped" in caplog.text
+    assert "previous_response=True" in caplog.text
+    assert "fresh_replay=False" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_http_bridge_liveness_timeout_is_neutral_not_replayed_and_forces_retirement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

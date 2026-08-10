@@ -1114,15 +1114,52 @@ class _HTTPBridgeUpstreamEventsMixin:
                 session.last_upstream_close_code = message.close_code
                 retried = False
                 # Account-neutral transport failures do not prove that the
-                # upstream rejected response.create. The request may still be
-                # executing, so replay could duplicate work, billing, or tool
-                # side effects. Clean closes remain eligible for the bounded
-                # pre-created retry circuit maintained by the session.
+                # upstream rejected response.create. Process-wide network and
+                # liveness failures therefore remain non-replayable. An
+                # eventless stream_incomplete is offered to the existing
+                # bounded pre-created gate, which still rejects ambiguous
+                # continuations and any request with visible output.
                 account_neutral = is_account_neutral_websocket_error_code(message.error_code)
-                if not account_neutral:
+                eventless_stream_incomplete = message.error_code == "stream_incomplete" and response_events_seen == 0
+                if not account_neutral or eventless_stream_incomplete:
                     retried = await self._retry_http_bridge_precreated_request(session)
                 if retried:
                     continue
+                if eventless_stream_incomplete:
+                    async with session.pending_lock:
+                        replay_candidates = [
+                            request_state
+                            for request_state in session.pending_requests
+                            if not request_state.draining_until_terminal
+                        ]
+                        replay_candidate = replay_candidates[0] if len(replay_candidates) == 1 else None
+                    _log_http_bridge_event(
+                        "retry_precreated_eventless_skipped",
+                        session.key,
+                        account_id=session.account.id,
+                        model=session.request_model,
+                        pending_count=len(replay_candidates),
+                        detail=(
+                            "candidate_count=%s previous_response=%s fresh_replay=%s replay_count=%s "
+                            "response_events=%s downstream_visible=%s"
+                            % (
+                                len(replay_candidates),
+                                bool(replay_candidate and replay_candidate.previous_response_id),
+                                bool(
+                                    replay_candidate
+                                    and replay_candidate.fresh_upstream_request_is_retry_safe
+                                    and replay_candidate.fresh_upstream_request_text
+                                ),
+                                replay_candidate.replay_count if replay_candidate is not None else None,
+                                replay_candidate.response_event_count if replay_candidate is not None else None,
+                                replay_candidate.downstream_visible if replay_candidate is not None else None,
+                            )
+                        ),
+                        cache_key_family=session.key.affinity_kind,
+                        model_class=(_extract_model_class(session.request_model) if session.request_model else None),
+                        response_events_seen=response_events_seen,
+                        transport_classification="websocket_transport_error",
+                    )
                 close_classification = (
                     _classify_upstream_close(message.close_code, response_events_seen=response_events_seen)
                     if message.close_code is not None

@@ -2621,6 +2621,7 @@ def _log_http_bridge_event(
         "retry_fresh_upstream",
         "retry_precreated",
         "retry_precreated_clean_close",
+        "retry_precreated_eventless_skipped",
         "reconnect",
         "terminal_error",
         "capacity_exhausted_active_sessions",

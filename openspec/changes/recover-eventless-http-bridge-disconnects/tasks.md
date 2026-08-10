@@ -1,0 +1,4 @@
+- [x] Route eventless `stream_incomplete` failures through the bounded pre-visible replay gate.
+- [x] Add privacy-safe diagnostics for rejected abrupt-disconnect replay decisions; accepted attempts use the existing retry diagnostics.
+- [x] Add regression tests for safe replay and ambiguous continuation rejection; retain the existing partial-output and network/liveness regression coverage.
+- [x] Run focused HTTP bridge tests and `openspec validate --specs`.

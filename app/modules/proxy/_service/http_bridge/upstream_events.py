@@ -333,6 +333,10 @@ _UNSUPPORTED_DURABLE_TOOL_CALL_ITEM_TYPES = frozenset(
         "mcp_approval_request",
     }
 )
+_INCOMPLETE_TOOL_COMPLETION_MESSAGE = (
+    "Upstream response.completed tool-call manifest did not match emitted response.output_item.done events"
+)
+_INCOMPLETE_TOOL_COMPLETION_DETAIL = "completed_inconsistent_tool_call_manifest"
 
 
 def _record_http_bridge_tool_call_lifecycle(
@@ -400,6 +404,60 @@ def _response_completed_tool_call_types(payload: dict[str, JsonValue] | None) ->
             return None
         result[call_id] = item_type
     return result
+
+
+def _http_bridge_completed_tool_call_manifest_is_incomplete(
+    request_state: _WebSocketRequestState,
+    payload: dict[str, JsonValue] | None,
+) -> bool:
+    """Reject terminal tool calls that were never emitted as complete items."""
+
+    response = payload.get("response") if isinstance(payload, dict) else None
+    output = response.get("output") if isinstance(response, dict) else None
+    if not isinstance(output, list) or not output:
+        return False
+
+    terminal_call_ids: set[str] = set()
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type not in _PENDING_TOOL_CALL_ITEM_TYPES:
+            continue
+        call_id = item.get("call_id")
+        if not isinstance(call_id, str) or not call_id or call_id in terminal_call_ids:
+            return True
+        terminal_call_ids.add(call_id)
+        if request_state.pending_tool_call_types.get(call_id) != item_type:
+            return True
+    return False
+
+
+def _rewrite_http_bridge_incomplete_tool_completion(
+    request_state: _WebSocketRequestState,
+    payload: dict[str, JsonValue] | None,
+) -> tuple[OpenAIEvent | None, dict[str, JsonValue], str, str]:
+    """Build a failed terminal event while retaining trustworthy usage."""
+
+    failed_payload = cast(
+        dict[str, JsonValue],
+        dict(
+            response_failed_event(
+                "stream_incomplete",
+                _INCOMPLETE_TOOL_COMPLETION_MESSAGE,
+                error_type="server_error",
+                response_id=request_state.response_id or request_state.request_id,
+            )
+        ),
+    )
+    source_response = payload.get("response") if isinstance(payload, dict) else None
+    failed_response = failed_payload.get("response")
+    if isinstance(source_response, dict) and isinstance(failed_response, dict):
+        usage = source_response.get("usage")
+        if isinstance(usage, dict):
+            cast(dict[str, JsonValue], failed_response)["usage"] = usage
+    event = parse_sse_event_payload(failed_payload)
+    return event, failed_payload, "response.failed", format_sse_event(failed_payload)
 
 
 def _durable_pending_tool_call_manifest(
@@ -1452,6 +1510,20 @@ class _HTTPBridgeUpstreamEventsMixin:
                 ):
                     matched_request_state.suppressed_duplicate_tool_call = True
                     return
+                if event_type == "response.completed" and _http_bridge_completed_tool_call_manifest_is_incomplete(
+                    matched_request_state,
+                    payload,
+                ):
+                    matched_request_state.error_http_status_override = 502
+                    matched_request_state.failure_phase_override = "upstream"
+                    matched_request_state.failure_detail_override = _INCOMPLETE_TOOL_COMPLETION_DETAIL
+                    matched_request_state.upstream_error_code_override = "stream_incomplete"
+                    session.upstream_control.reconnect_requested = True
+                    session.upstream_control.retire_after_drain = True
+                    event, payload, event_type, event_block = _rewrite_http_bridge_incomplete_tool_completion(
+                        matched_request_state,
+                        payload,
+                    )
                 if event_type in _TEXT_DELTA_EVENT_TYPES:
                     matched_request_state.downstream_visible = True
                 if event_type == "response.created" and matched_request_state.suppress_next_created_downstream:

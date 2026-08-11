@@ -468,6 +468,75 @@ class _InterruptedCustomToolUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
         )
 
 
+class _ToolCompletionUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    def __init__(self, *, emit_done: bool) -> None:
+        super().__init__("resp_bridge_tool")
+        self._emit_done = emit_done
+
+    async def send_text(self, text: str) -> None:
+        self.sent_text.append(text)
+        response_id = f"{self.response_id_prefix}_{len(self.sent_text)}"
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.created",
+                        "response": {"id": response_id, "object": "response", "status": "in_progress"},
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+        tool_item = {
+            "id": "fc_edit",
+            "type": "function_call",
+            "status": "completed",
+            "call_id": "call_edit",
+            "name": "edit",
+            "arguments": "{}",
+        }
+        if self._emit_done:
+            await self._messages.put(
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps(
+                        {
+                            "type": "response.output_item.done",
+                            "response_id": response_id,
+                            "item": tool_item,
+                            "output_index": 0,
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+            )
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": response_id,
+                            "object": "response",
+                            "status": "completed",
+                            "output": [tool_item],
+                            "usage": {
+                                "input_tokens": 24,
+                                "output_tokens": 2,
+                                "total_tokens": 26,
+                                "input_tokens_details": {"cached_tokens": 20},
+                                "output_tokens_details": {"reasoning_tokens": 1},
+                            },
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+
+
 class _ClosingInterruptedCustomToolUpstreamWebSocket(_InterruptedCustomToolUpstreamWebSocket):
     def __init__(self, response_id_prefix: str = "resp_bridge") -> None:
         super().__init__(response_id_prefix, emit_added=True)
@@ -6581,6 +6650,138 @@ async def test_v1_responses_http_bridge_streaming_path_uses_persistent_upstream_
     events = [json.loads(line[6:]) for line in lines if line[6:] != "[DONE]"]
     _assert_created_text_delta_completed(events)
     assert connect_count == 1
+
+
+@pytest.mark.parametrize(
+    ("emit_done", "expected_event_types", "expected_status"),
+    [
+        (False, ["response.created", "response.failed"], "error"),
+        (
+            True,
+            ["response.created", "response.output_item.done", "response.completed"],
+            "success",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_requires_streamed_tool_call_payload_before_completion(
+    async_client,
+    app_instance,
+    monkeypatch,
+    emit_done,
+    expected_event_types,
+    expected_status,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    suffix = "valid" if emit_done else "missing"
+    account_id = await _import_account(
+        async_client,
+        f"acc_http_bridge_tool_completion_{suffix}",
+        f"http-bridge-tool-completion-{suffix}@example.com",
+    )
+    account = await _get_account(account_id)
+    fake_upstream = _ToolCompletionUpstreamWebSocket(emit_done=emit_done)
+
+    async def fake_select_account_with_budget(
+        self,
+        deadline,
+        *,
+        request_id,
+        kind,
+        request_stage="first_turn",
+        sticky_key,
+        sticky_kind,
+        reallocate_sticky,
+        sticky_max_age_seconds,
+        prefer_earlier_reset_accounts,
+        routing_strategy,
+        model,
+        exclude_account_ids=None,
+        additional_limit_name=None,
+        api_key=None,
+        preferred_account_id=None,
+    ):
+        del preferred_account_id
+        del (
+            self,
+            deadline,
+            request_id,
+            kind,
+            request_stage,
+            sticky_key,
+            sticky_kind,
+            reallocate_sticky,
+            sticky_max_age_seconds,
+            prefer_earlier_reset_accounts,
+            routing_strategy,
+            model,
+            exclude_account_ids,
+            additional_limit_name,
+        )
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, account_id_header, base_url, session
+        return fake_upstream
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    events = await _collect_sse_events(
+        async_client,
+        "/v1/responses",
+        json_body={
+            "model": "gpt-5.1",
+            "input": "hello",
+            "prompt_cache_key": f"http-bridge-tool-completion-{suffix}",
+            "stream": True,
+        },
+    )
+
+    assert [event["type"] for event in events] == expected_event_types
+    service = get_proxy_service_for_app(app_instance)
+    assert await service.drain_persistence_tasks(timeout_seconds=10)
+    async with SessionLocal() as db_session:
+        rows = list(
+            (
+                await db_session.execute(
+                    select(RequestLog).where(RequestLog.account_id == account_id).order_by(RequestLog.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    request_log = rows[0]
+    assert request_log.status == expected_status
+    assert request_log.input_tokens == 24
+    assert request_log.output_tokens == 2
+    assert request_log.cached_input_tokens == 20
+    assert request_log.reasoning_tokens == 1
+    if emit_done:
+        assert events[-1]["response"]["output"][0]["call_id"] == "call_edit"
+        assert request_log.error_code is None
+    else:
+        assert events[-1]["response"]["error"]["code"] == "stream_incomplete"
+        assert all(event["type"] != "response.output_item.done" for event in events)
+        assert request_log.error_code == "stream_incomplete"
+        assert request_log.failure_phase == "upstream"
+        assert request_log.failure_detail == "completed_inconsistent_tool_call_manifest"
+        assert request_log.upstream_error_code == "stream_incomplete"
+        assert service._load_balancer._runtime[account_id].error_count == 1
+        assert next(iter(service._http_bridge_sessions.values())).upstream_control.retire_after_drain is True
 
 
 @pytest.mark.asyncio
